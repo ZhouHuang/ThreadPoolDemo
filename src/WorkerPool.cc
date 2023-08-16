@@ -48,10 +48,11 @@ namespace mt {
                     std::cout << ex.what() << '\n';
                 }
                 m_job = nullptr;
+            } else {
+                std::this_thread::yield();
             }
             m_running = false;
             m_lck.store(false);
-            std::this_thread::yield();
             // std::this_thread::sleep_for(std::chrono::milliseconds(100)); 
         }
     }
@@ -105,8 +106,9 @@ namespace mt {
                     printf("waiting workers...\rwaiting workers...");
                     fflush(stdout);
                 }
+            } else {
+                std::this_thread::yield();
             }
-            std::this_thread::yield();
         }
     }
     /*
