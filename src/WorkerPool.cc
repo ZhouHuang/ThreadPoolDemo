@@ -1,174 +1,170 @@
-#include "WorkerPool.hh"
-
+#include "MultiThread.h"
 
 namespace mt {
-    using std::cerr;
-    // class WorkerThread
-    // public
 
-    WorkerThread::WorkerThread(int cpubind) {
-        printf("worker constructed...\n");
-        m_job = nullptr;
-        if (cpubind >=0) {
-            set_thread_affinity(m_thread, cpubind);
+void WorkerThread::join() {
+    if (m_thread.joinable()) {
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_stop = true;
+            m_cv.notify_all(); // 通知loop函数停止
         }
+
+        // 等待任务执行完毕或线程结束
+        if (m_jobRunning.load()) {
+            std::unique_lock<std::mutex> lock(m_jobMutex);
+            m_jobCv.wait(lock, [this] { return !m_jobRunning.load(); });
+        }
+
+        m_thread.join();
     }
-    void WorkerThread::join() {
-        printf("in join...\n");
-        while (m_job) {
-            ;
-        }
-        printf("before stop...\n");
-        m_stop = true;
-        if (m_thread.joinable()) {
-            m_thread.join();
-        }
+}
+
+bool WorkerThread::run_done() const {
+    return !m_jobRunning.load();
+}
+
+bool WorkerThread::set_job(const std::function<void()> &f, bool bFork) {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    if (!m_stop && !m_jobRunning.load()) { // 只有在没有停止并且没有任务正在运行时才设置新任务
+        m_job = f;
+        m_bFork = bFork;
+        m_jobRunning.store(true); // 标记任务正在运行
+        m_cv.notify_one();        // 通知loop函数有新任务
+        return true;
     }
-    bool WorkerThread::set_job(const std::function<void()>& f, bool bFork) {
-        // TODO: bFork
-        if (!m_lck.load()) {
-            printf("set job [success]...\n");
-            m_job = f;
-            m_lck.store(true);
-            return true;
+    return false;
+}
+
+void WorkerThread::loop() {
+    while (true) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this] { return m_stop || m_job; });
+
+        if (m_stop && !m_job) {
+            break;
         }
-        printf("set job [fail]...\rset job [fail]...");
-        return false;
-    }
-    
-    // private
-    void WorkerThread::loop() {
-        while(!m_stop) {
-            m_lck.store(true); // m_lck looks like m_running
-            m_running = true;
-            if (m_job) {
-                try {
-                    m_job();
-                } catch (const std::exception& ex) {
-                    std::cout << ex.what() << '\n';
-                }
-                m_job = nullptr;
-            } else {
-                std::this_thread::yield();
+
+        lock.unlock();
+
+        // 执行任务
+        if (m_job) {
+            {
+                std::unique_lock<std::mutex> jobLock(m_jobMutex);
+                m_job(); // 执行任务
             }
-            m_running = false;
-            m_lck.store(false);
-            // std::this_thread::sleep_for(std::chrono::milliseconds(100)); 
+
+            // 标记任务执行完毕
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_job = nullptr;
+                m_jobRunning.store(false);
+            }
+            m_jobCv.notify_all(); // 通知可能在join中等待的线程
+
+            if (m_bFork) {
+                // 如果需要fork（在这个例子中我们不实际fork，只是演示）
+                // ... 执行fork相关的逻辑
+                m_bFork = false; // 重置fork标志
+            }
         }
     }
-    
+}
 
-    // class WorkerPool
-    // public:
+WorkerPool::WorkerPool(int poolsize, bool bFork)
+    : m_poolsize{poolsize}, m_fork{bFork}, m_threads{static_cast<size_t>(poolsize)} {
+    m_controller_thread = std::thread(&WorkerPool::schedule_loop, this);
+}
 
-    void WorkerPool::join() {
-        while(!m_jobs.empty()){
-            ;
-        }
+void WorkerPool::join() {
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
         m_stop = true;
-        if (m_controller_thread.joinable())
-            m_controller_thread.join();
-        for(auto& thr : m_threads) {
-            thr.join();
+        m_cv.notify_all(); // 通知所有等待的线程
+    }
+
+    if (m_controller_thread.joinable()) {
+        m_controller_thread.join();
+    }
+
+    for (auto &thr : m_threads) {
+        thr.join();
+    }
+}
+
+void WorkerPool::add_job(const std::function<void()> &f, const std::string &info) {
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (!m_stop) {
+            m_jobs.emplace_back(f, info); // 假设name不使用，仅放空字符串
+            ++m_remaining_jobs;
         }
-
-
+        m_cv.notify_one(); // 通知调度线程可能有新任务
     }
-    void WorkerPool::add_job(const std::function<void()>& f, const std::string& info) {
-        if (m_stop)
-            throw std::runtime_error("WokerPool already stopped...");
-        m_lck.store(true);
-        printf("add job %s...\n", info.c_str());
-        m_jobs.push_back({f, info});
-        m_lck.store(false);
-    }
-    //private:
-    void WorkerPool::schedule_loop(){
-        while(!m_stop) {
-            if (!m_lck.load()){
-                int i = 0;
-                for(auto& worker : m_threads) {
-                    i++;
-                    if (m_jobs.empty()){
+}
+
+void WorkerPool::schedule_loop() {
+    while (true) {
+        std::function<void()> job;
+        std::string info;
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait(lock, [this] { return m_stop || !m_jobs.empty(); });
+
+            if (m_stop && m_jobs.empty()) {
+                break;
+            }
+
+            if (!m_jobs.empty()) {
+                job = std::move(m_jobs.front().first);
+                info = std::move(m_jobs.front().second);
+                m_jobs.pop_front();
+                --m_remaining_jobs;
+            }
+            if (job) {
+                bool job_dispatched = false;
+                for (auto &worker : m_threads) {
+                    if (worker.set_job(job, false)) {
+                        job_dispatched = true;
                         break;
                     }
-                    auto& job = m_jobs.front();
-                    // printf("job %s on front...\n", job.second.c_str());
-                    if (worker.set_job(job.first)) {
-                        printf("worker %d handles job %s...\n", i, job.second.c_str());
-                        m_jobs.pop_front();
-                        continue;
-                    } else{
-                        // printf("worker %d busy...\n", i);
-                    }
                 }
-                if (!m_jobs.empty()) {
-                    printf("waiting workers...\rwaiting workers...");
-                    fflush(stdout);
-                }
-            } else {
-                std::this_thread::yield();
-            }
-        }
-    }
-    /*
-    void WorkerPool::schedule_loop() {
-        printf("in schedule loop...\n");
-        while(true) {
-            for(auto& worker : m_threads) {
-                while(!m_jobs.empty()) {
-                    auto f = m_jobs.front();
-                    if (worker.set_job(f)) {
-                        m_jobs.pop_front();
-                    }
-                    break;
+
+                if (!job_dispatched) {
+                    // 没有找到空闲的线程，将任务重新放回队列
+                    m_jobs.emplace_front(job, info);
+                    ++m_remaining_jobs;
                 }
             }
-        };
-    }
-    */
-
-    /*
-    void WorkerPool::schedule_loop() {
-        for(int i = 0; i<m_threads.size(); ++i) {
-            m_threads.at(i).set_job(
-                [this]
-                {
-                    for(;;)
-                    {
-                        std::function<void()> job;
-
-                        {
-                            while (this->m_lck)  // 自旋锁
-                                ;
-
-                            if (this->m_stop && this->m_jobs.empty())
-                                return;
-                            
-                            job = std::move(this->m_jobs.front());
-                            this->m_jobs.pop_front();
-
-                        }
-
-                        job();
-                    }
-                }
-            );
+            m_jobCv.notify_one();
         }
     }
-    */
-
-    // other function
-    void set_thread_affinity(std::thread& thr, int cpu_id) {
-
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(cpu_id, &cpuset);
-
-        int rc = pthread_setaffinity_np(thr.native_handle(), sizeof(cpu_set_t), &cpuset);
-        if (rc != 0) {
-            std::cerr << "Error calling pthread_setaffinity_np: " << rc << "\n";
-        }
-    }
-
 }
+
+void WorkerPool::run() {
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        // 等待任务分配完毕
+        if (m_remaining_jobs > 0) {
+            m_jobCv.wait(lock, [this] { return 0 == m_remaining_jobs; });
+        }
+        printf("jobs are dispatched done\n");
+    }
+    auto all_done = [this] () {
+            for (const auto &worker : m_threads) {
+                if (!worker.run_done()) {
+                    return false;
+                }
+            }
+            return true;
+        };
+    // 等待所有线程执行结束. 此处的while循环可被更高效的cv替代?
+    while(1) {
+        if (all_done()) {
+            break;
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+} // namespace mt
